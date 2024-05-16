@@ -5,6 +5,8 @@ library(dplyr)
 library(stringr) 
 library(pheatmap)
 library(ggpubr)
+library(Matrix)
+library(monocle)
 
 ##### 数据导入及预处理 #####
 rm(list = ls()) # 清除当前环境中的所有对象
@@ -266,3 +268,39 @@ sce <- AddMetaData(object = sce, metadata = celltype,
 DimPlot(sce,reduction='umap',label =TRUE,group.by='celltype')#按celltype分组查看umap降维结果
 DimPlot(sce,reduction='tsne',label =TRUE,group.by='celltype')#按celltype分组查看umap降维结果
 
+########## 拟时序分析 #####
+# 使用Seurat的subset()函数从原始Seurat对象sce中选取特定聚类（idents）的细胞来创建新的Seurat对象macrophage
+macrophage <- subset(sce, idents = c(2, 6, 7))
+table(macrophage@meta.data[["celltype"]])# 使用table()函数查看meta.data元数据中celltype列的分布情况
+
+# 使用GetAssayData()函数从macrophage对象的RNA测定中获取名为counts的层级数据
+counts_data <- GetAssayData(object = macrophage, assay = "RNA", layer = "counts")
+data <- Matrix(counts_data, sparse = TRUE)# 将获取的counts数据转换为稀疏矩阵，这对于处理大规模数据集更加高效
+
+# 创建一个新的AnnotatedDataFrame对象pd，包含macrophage的元数据
+pd <- new('AnnotatedDataFrame', data = macrophage@meta.data)
+# 创建一个新的数据框fData，包含基因的简短名称，这里gene_short_name即data稀疏矩阵的行名
+fData <- data.frame(gene_short_name = row.names(data), row.names = row.names(data))
+# 创建一个新的AnnotatedDataFrame对象fd，包含基因的元数据
+fd <- new('AnnotatedDataFrame', data = fData)
+
+# 使用newCellDataSet()函数创建HSMM对象，包含数据data、表型数据pd和特征数据fd
+HSMM <- newCellDataSet(data, phenoData = pd, featureData = fd, expressionFamily = negbinomial.size())
+HSMM <- estimateSizeFactors(HSMM)# 估计HSMM对象中每个细胞的大小因子，用于标准化跨细胞的表达水平
+HSMM <- estimateDispersions(HSMM)# 估计HSMM对象中每个基因的离散度
+HSMM <- detectGenes(HSMM, min_expr = 0.1)# 检测HSMM对象中的显著性基因，只考虑表达高于阈值min_expr的基因
+disp_table <- dispersionTable(HSMM)# 为HSMM对象生成一个离散度表，包含基因的表达水平和离散度估计
+unsup_clustering_genes <- subset(disp_table, mean_expression >= 0.1)# 从离散度表中选择表达水平高于阈值0.1的基因进行无监督聚类分析
+HSMM_myo <- setOrderingFilter(HSMM, unsup_clustering_genes$gene_id)# 为HSMM对象设置无监督聚类过滤，使用选定的基因
+
+plot_ordering_genes(HSMM)# 绘制HSMM对象的排序基因图，展示基因表达的动态变化
+
+# 使用DDRTree方法对HSMM_myo对象进行降维处理，只保留最多两个主成分
+HSMM_myo <- reduceDimension(HSMM_myo, max_components = 2, reduction_method = 'DDRTree', verbose = T)
+HSMM_myo <- orderCells(HSMM_myo)# 对HSMM_myo对象执行细胞排序，确定细胞在轨迹上的位置
+
+plot_cell_trajectory(HSMM_myo, color_by = 'State')# 绘制HSMM_myo对象的细胞轨迹图，根据State注解进行着色
+# 绘制HSMM_myo对象的细胞轨迹图，根据拟时间值Pseudotime进行着色，并设置细胞大小
+plot_cell_trajectory(HSMM_myo, color_by = 'Pseudotime', cell_size = 0.75)
+# 绘制HSMM_myo对象的细胞轨迹图，根据Seurat聚类结果seurat_clusters进行着色，并设置细胞大小
+plot_cell_trajectory(HSMM_myo, color_by = 'seurat_clusters', cell_size = 0.75)
