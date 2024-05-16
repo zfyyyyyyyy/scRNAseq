@@ -1,0 +1,268 @@
+# 加载所需的R包
+library(Seurat)
+library(clustree) 
+library(dplyr)
+library(stringr) 
+library(pheatmap)
+library(ggpubr)
+
+##### 数据导入及预处理 #####
+rm(list = ls()) # 清除当前环境中的所有对象
+# 载入数据集
+counts=read.table('./GSE111229_Mammary_Tumor_fibroblasts_768samples_rawCounts.txt.gz',
+                  header = T ,sep = '\t')  # 读取表达矩阵文件
+counts[1:4,1:4];dim(counts)  # 查看数据的前几行和维度
+
+dat=counts[apply(counts,1, function(x) sum(x>1) > floor(ncol(counts)/50)),] # 过滤表达量低的基因
+dat=log2(edgeR::cpm(dat)+1)# 计算CPM（Counts Per Million）表达量
+
+hc=hclust(dist(t(dat))) # 样本间层次聚类
+plot(hc,labels = FALSE)  # 绘制层次聚类树状图
+clus = cutree(hc, 4) # 剪枝得到4个聚类
+group_list= as.factor(clus) # 将聚类结果转换为因子类型
+table(group_list) # 统计每个聚类的样本数量
+
+plate=str_split(colnames(dat),'_',simplify = T)[,3] # 提取列名中的批次信息
+table(plate)  # 统计每个批次的样本数量
+n_g = apply(dat,2,function(x) sum(x>1)) # 计算每个样本表达的基因数
+meta=data.frame(g=group_list,plate=plate,n_g=n_g) # 创建包含样本属性信息的数据框
+head(meta)  # 查看数据框的前几行
+
+# 下面是文章作者给出的基因列表
+gs=read.table('top18-genes-in-4-subgroup.txt')[,1]
+
+# 统计和可视化表达矩阵的初步质控指标
+fivenum(apply(dat,1,function(x) sum(x>0) ))  # 计算每个样本的表达非零基因数量的五数概括
+boxplot(apply(dat,1,function(x) sum(x>0) ))  # 绘制箱线图
+fivenum(apply(dat,2,function(x) sum(x>0) ))  # 计算每个基因的表达非零样本数量的五数概括
+hist(apply(dat,2,function(x) sum(x>0) ))  # 绘制直方图查看数据
+
+##### 数据初步质控 #####
+cg=names(tail(sort(apply(dat,1,sd)),100)) # 取表达量标准差最大的100个基因
+# 绘制热图，不进行聚类
+pheatmap(dat[cg,],show_colnames =F,show_rownames = F,
+         filename = 'all_cells_top_100_sd.png')
+
+n=t(scale(t(dat[cg,]))) # 对选定基因集的表达量进行标准化
+n[n>2]=2 # 设置表达量上限为2
+n[n< -2]= -2 # 设置表达量下限为-2
+ac=data.frame(g=group_list) # 创建样本分组信息数据框
+rownames(ac)=colnames(n) # 设置数据框的行名为样本名
+# 绘制热图，使用样本分组信息进行颜色标注
+pheatmap(n,show_colnames =F,show_rownames = F,
+         annotation_col=ac,
+         filename = 'all_cells_top_100_sd_cutree1.png')
+
+# 重新进行层次聚类和分组
+hc=hclust(dist(t(n))) 
+clus = cutree(hc, 4)
+group_list=as.factor(clus)
+ac=data.frame(g=group_list)
+rownames(ac)=colnames(n)
+pheatmap(n,show_colnames =F,show_rownames = F,
+         annotation_col=ac,
+         filename = 'all_cells_top_100_sd_cutree_2.png')
+
+dat=t(dat)
+dat=cbind(dat,group_list ) # 将聚类结果添加到数据集中
+dat[1:4,12197:12199] # 查看数据集的特定区域
+dat.pca <- PCA(dat[,-ncol(dat)], graph = FALSE) # 进行主成分分析
+
+# 可视化PCA结果
+fviz_pca_ind(dat.pca,repel =T,
+             geom.ind = "point", 
+             col.ind = dat$group_list,
+             addEllipses = TRUE,
+             legend.title = "Groups"
+)
+ggsave('all_cells_PCA.png')  # 保存PCA图
+
+##### CV计算 #####
+# 计算CV^2以评估技术噪音
+exprSet=dat
+mean_per_gene <- apply(exprSet, 1, mean, na.rm = TRUE) # 计算每个基因的平均表达量
+sd_per_gene <- apply(exprSet, 1, sd, na.rm = TRUE) # 计算每个基因的标准差
+mad_per_gene <-   apply(exprSet, 1, mad, na.rm = TRUE) # 计算每个基因的绝对中位差
+
+cv_per_gene <- data.frame(mean = mean_per_gene,
+                          sd = sd_per_gene,
+                          mad=mad_per_gene,
+                          cv = sd_per_gene/mean_per_gene) # 计算变异系数
+rownames(cv_per_gene) <- rownames(exprSet)
+
+# 绘制变异系数的平方与平均表达量的关系图
+with(cv_per_gene,plot(log10(mean),log10(cv)))
+with(cv_per_gene,plot(log10(mean),log10(cv^2)))
+
+# RPKM绘图相关操作
+cv_per_gene$log10cv2=log10(cv_per_gene$cv^2)
+cv_per_gene$log10mean=log10(cv_per_gene$mean)
+cv_per_gene=cv_per_gene[cv_per_gene$log10mean < 4, ]
+cv_per_gene=cv_per_gene[cv_per_gene$log10mean > 0, ]
+ggscatter(cv_per_gene, x = 'log10mean', y = 'log10cv2',
+          color = "black", shape = 16, size = 1,
+          xlab = 'log10(mean)RPKM', ylab = "log10(cv^2)",
+          add = "loess", 
+          add.params = list(color = "red",fill = "lightgray"),
+          cor.coeff.args = list(method = "spearman"), 
+          label.x = 3,label.sep = "\n",
+          dot.size = 2,
+          ylim=c(-0.5, 3),
+          xlim=c(0,4) 
+)
+
+##### 构建 Seurat 需要的对象 #####
+sce <- CreateSeuratObject(counts = counts, 
+                          meta.data =meta,
+                          min.cells = 5, 
+                          min.features = 2000, 
+                          project = "sce")
+
+# 检查过滤参数的效果
+table(apply(counts,2,function(x) sum(x>0) )>2000)
+table(apply(counts,1,function(x) sum(x>0) )>4)
+
+# 使用不同的分组信息绘制特征分布图
+VlnPlot(object = sce,
+        features = c("nCount_RNA", "nFeature_RNA"), 
+        group.by = 'plate',
+        ncol  = 2)
+VlnPlot(object = sce, 
+        features = c("nCount_RNA", "nFeature_RNA"), 
+        group.by = 'g',
+        ncol = 2)
+
+# 添加ERCC和线粒体基因检测，用于质控
+raw_counts <- GetAssayData(object = sce, assay = "RNA", layer = "counts")
+ercc.genes <- grep(pattern = "^ERCC-", x = rownames(raw_counts), value = TRUE)
+mito.genes <- grep(pattern = "^MT-", x = rownames(raw_counts), value = TRUE)
+percent.ercc <- Matrix::colSums(raw_counts[ercc.genes, ]) / Matrix::colSums(raw_counts)
+
+sce <- AddMetaData(object = sce, metadata = percent.ercc,
+                   col.name = "percent.ercc")
+
+# 可视化质控指标
+VlnPlot(object = sce, 
+        features = c( "nFeature_RNA","nCount_RNA", "percent.ercc"),  
+        group.by = 'plate',
+        ncol = 3)
+VlnPlot(object = sce, 
+        features = c( "nFeature_RNA","nCount_RNA", "percent.ercc"),  
+        group.by = 'g',
+        ncol = 3)
+
+# 执行质控，去除低质量和高表达量的样本
+sce = subset(sce,subset = nFeature_RNA>300&nFeature_RNA<7000&
+               nCount_RNA>1000&nCount_RNA<quantile(nCount_RNA,0.97))
+
+##### 数据标准化、寻找高变基因、归一化 #####
+# 使用LogNormalize方法对Seurat对象中的数据进行标准化，scale.factor是标准化的因子
+sce <- NormalizeData(object = sce, 
+                     normalization.method = "LogNormalize", 
+                     scale.factor = 10000)
+# 寻找高变基因，即在不同样本中表达变化大的基因
+sce <- FindVariableFeatures(sce)
+
+# 查看元数据的前几行
+head(sce@meta.data) 
+# 归一化数据，去除一些技术误差，如ERCC（外部RNA控制元件）
+sce <- ScaleData(object = sce, 
+                 vars.to.regress = c("percent.ercc"))
+
+##### 多批次数据整合，此样本不需要 #####
+# 使用CCA方法进行多批次数据整合，orig.reduction指定原始降维方式为PCA
+sce-cca = IntegrateLayers(object=sce,
+                          method=CCAIntegration,
+                          orig.reduction = "pca",
+                          verbose=F)
+# 使用JoinLayers合并counts和data数据
+sce-cca[['RNA']] = JoinLayers(sce-cca[['RNA']])
+
+##### 降维聚类 #####
+# 运行PCA进行数据降维
+sce <- RunPCA(object = sce,verbose=F)
+# 绘制前10个主成分的热图，展示500个细胞，平衡正负特征，展示20个特征
+DimHeatmap(sce,dims = 1:10,cells = 500,balanced = TRUE,nfeatures = 20)
+
+# JackStraw方法评估PCA主成分的质量
+sce=JackStraw(sce,num.replicate = 100)
+# 为每个主成分计算JackStraw分数
+sce=ScoreJackStraw(sce,dims =1:20)
+# 绘制JackStraw图，展示前20个主成分的稳定性
+JackStrawPlot(sce,dims =1:20,reduction='pca')
+
+# 绘制肘图，确定合适的主成分数量
+ElbowPlot(sce,ndims = 50)
+# 寻找最近邻点，为聚类做准备
+sce=FindNeighbors(sce,reduction='pca')
+# 根据不同的分辨率进行聚类
+sce=FindClusters(sce,resolution =seq(from=0.1,to=1.0,by=0.1))
+# 使用UMAP算法进行数据降维
+sce=RunUMAP(sce,reduction='pca',dims =1:12 )
+# 使用t-SNE算法进行数据降维
+sce=RunTSNE(sce,reduction='pca',dims =1:12 )
+
+# 绘制UMAP降维结果的二维图，并按plate分组进行标记
+DimPlot(sce,reduction='umap',label =TRUE)
+# 绘制t-SNE降维结果的二维图，并按plate分组进行标记
+DimPlot(sce,reduction='tsne',label =TRUE)
+
+# 寻找特定聚类的标记基因
+markers_df <- FindMarkers(object = sce, ident.1 = 1, 
+                          min.pct = 0.25)
+# 打印前几行标记基因结果
+print(x = head(markers_df))
+# 提取前5个标记基因的名称
+markers_genes =  rownames(head(x = markers_df, n = 5))
+# 使用小提琴图可视化这些标记基因的表达分布
+VlnPlot(object = sce, features=markers_genes)
+
+# 使用特征图展示前5个标记基因在t-SNE降维结果上的分布
+FeaturePlot(object = sce, 
+            features=markers_genes, 
+            cols = c("grey", "blue"), 
+            reduction= "tsne")
+# 使用特征图展示文献作者给出的基因在t-SNE降维结果上的分布
+FeaturePlot(object = sce, 
+            features =gs[1:18], 
+            cols = c("grey", "blue"), 
+            reduction= "tsne")
+# 以此类推，展示其他基因的分布
+
+# 对每个聚类找到自己的标记基因
+sce.markers <- FindAllMarkers(object = sce, only.pos = TRUE, 
+                              min.pct = 0.25, 
+                              thresh.use = 0.25)
+
+# 为每个聚类找到前2个和前10个标记基因
+top2 <- sce.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+top10 <- sce.markers %>% group_by(cluster) %>% top_n(10, avg_log2FC)
+# 找出top10标记基因与文献中给出的基因的交集
+intersect(top10$gene,gs)
+
+# 绘制top10标记基因的热图
+DoHeatmap(object = sce,features  = top10$gene)
+
+# 使用特征图展示每个聚类的前2个标记基因在t-SNE降维结果上的分布
+FeaturePlot(object = sce, 
+            features=top2$gene, 
+            cols = c("grey", "blue"), 
+            reduction= "tsne")
+
+#####单细胞注释#####
+celltype <- c('Monocyte', 'B cell', 'Endothelial cell', 'CD4+ T cell', 'FGFR1HighNME5- epithelial cell', 
+              'SLC16A7+ cell', 'Stem cell', 'Astrocyte')
+cell_type_mapping <- c("Monocyte" = 0, 
+                       "B cell" = 1, 
+                       "Endothelial cell" = 2, 
+                       "CD4+ T cell" = 3, 
+                       "FGFR1HighNME5- epithelial cell" = 4, 
+                       "SLC16A7+ cell" = 5, 
+                       "Stem cell" = 6, 
+                       "Astrocyte" = 7)
+celltype <- names(cell_type_mapping)[sce@meta.data[["seurat_clusters"]]]
+sce <- AddMetaData(object = sce, metadata = celltype,
+                   col.name = "celltype")
+DimPlot(sce,reduction='umap',label =TRUE,group.by='celltype')#按celltype分组查看umap降维结果
+DimPlot(sce,reduction='tsne',label =TRUE,group.by='celltype')#按celltype分组查看umap降维结果
+
